@@ -2,7 +2,9 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -24,6 +26,7 @@ class thread_pool_t final
                 while (!m_stop_processing_tasks)
                 {
                     std::function<void()> current_task = {};
+
                     // Assumption is that if this thread is already running a function, the control flow will read this
                     // particular part ONLY if the function / task its execution is completed.
                     std::unique_lock<std::mutex> lock(m_queue_mutex);
@@ -64,13 +67,37 @@ class thread_pool_t final
     thread_pool_t &operator=(thread_pool_t &&other) = delete;
 
   public:
-    template <typename F> void enqueue(F &&func)
+    // NOTE: F and Args are && (r-values), so that perfect forwarding can work as expected.
+    // F is the function, while args is a VAL.
+    // perfect forwarding is used so that the 'type' of arg (i.e l / r value) is preserved.
+    // decltype is used to deduce at compile type return type of func(args...)
+    // Because the thread pools task queue only accepts functions that take and return NO parameters, bind is used to
+    // 'bind' the function and arguments to create a callbale func that is 0 args.
+    // A 'packaged task' is used to store the callable and return a future, which the host can use to get value of
+    // function.
+    template <typename F, typename... Args>
+    auto enqueue(F &&func, Args &&...args) -> std::future<decltype(func(args...))>
     {
+        // Bind the function and args to a single variable.
+        std::function<decltype(func(args...))()> binded_function =
+            std::bind(std::forward<F>(func), std::forward<Args>(args)...);
+
+        // Shared pointer to package task is created so that lifetime is properly managed.
+        auto shared_ptr_of_packaged_task =
+            std::make_shared<std::packaged_task<decltype(func(args...))()>>(binded_function);
+
+        std::future<decltype(func(args...))> future = shared_ptr_of_packaged_task->get_future();
+
         std::unique_lock<std::mutex> lock(m_queue_mutex);
 
         // add enqueued tasks to a queue.
-        m_task_queue.push(std::move(func));
+        // The lambda capture shared_ptr_of_packaged_task by value so that lifetime of the package task will be until
+        // the function is not finished execution.
+        m_task_queue.push([shared_ptr_of_packaged_task]() { (*shared_ptr_of_packaged_task)(); });
+
         m_cv.notify_one();
+
+        return future;
     }
 
   private:
@@ -93,5 +120,12 @@ int main()
             std::cout << "Work completed by thread : " << std::this_thread::get_id() << '\n';
         });
     }
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+
+    auto computation_result = thread_pool.enqueue([]() { return 33 * 55 * 99 * 33; });
+
+    while (computation_result.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    {
+    }
+
+    std::cout << "Computation result :: " << computation_result.get();
 }
